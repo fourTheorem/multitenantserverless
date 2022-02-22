@@ -1,0 +1,393 @@
+service: multitenantserverless
+frameworkVersion: '2'
+
+plugins:
+  - serverless-python-requirements
+
+package:
+  exclude:
+    - 'mtfrontend/**'
+
+provider:
+  name: aws
+  runtime: python3.8
+  lambdaHashingVersion: 20201221
+  stage: dev
+  region: eu-west-1
+  tracing:
+    apiGateway: true
+    lambda: true
+  logs:
+    restApi: true
+  logRetentionInDays: 7
+  environment:
+    STAGE: ${self:provider.stage}
+    TABLE_NAME: ${self:custom.tableName}
+    USER_POOL_ID: !Ref mtUserPool
+    USER_POOL_CLIENT_ID: !Ref mtUserPoolClient
+    USER_POOL_ARN: !GetAtt mtUserPool.Arn
+
+custom:
+  tableName: mt-table-${self:provider.stage}
+
+functions:
+  authorizer:
+    handler: authorizer.lambda_handler
+    role: !GetAtt AuthorizerExecutionRole.Arn
+
+  iamHandler:
+    handler: thing_handler.handle
+    events:
+      - http:
+          path: thing_iam
+          method: GET
+          cors: true
+          authorizer: aws_iam
+
+  poolHandler:
+    handler: thing_handler.handle
+    events:
+      - http:
+          path: thing_pool
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId:
+              Ref: poolAuthorizer
+
+  customAuthHandler:
+    handler: thing_handler.handle
+    events:
+      - http:
+          path: thing_custom
+          method: GET
+          cors: true
+          authorizer: authorizer
+
+  userGroupPutHandler:
+    handler: user-group-handler.handle_put
+    events:
+      - http:
+          path: user-group
+          method: PUT
+          cors: true
+          authorizer: authorizer
+
+  userGroupListHandler:
+    handler: user-group-handler.handle_list
+    events:
+      - http:
+          path: user-group
+          method: GET
+          cors: true
+          authorizer: authorizer
+
+  openHandler:
+    handler: thing_handler.handle
+    role: !GetAtt OpenRole.Arn
+    events:
+      - http:
+          path: thing_open
+          method: GET
+          cors: true
+
+resources:
+  Resources:
+    mtUserPool:
+      Type: AWS::Cognito::UserPool
+      Properties:
+        UserPoolName: mt-user-pool
+        UsernameAttributes: [email]
+        AutoVerifiedAttributes: [email]
+        AdminCreateUserConfig:
+          AllowAdminCreateUserOnly: false
+        Policies:
+          PasswordPolicy:
+            MinimumLength: 6
+            RequireLowercase: false
+            RequireUppercase: false
+            RequireNumbers: false
+            RequireSymbols: false
+        Schema:
+          - AttributeDataType: String
+            # NOTE! These attributes are mutable, meaning they can be changed after the user profile is created
+            # This does not mean that they can be written by the user on sign-up. That is governed by the 
+            # App Client attribute write settings (User Pool Client) which make them read-only by default!
+            # (https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-settings-attributes.html#user-pool-settings-attribute-permissions-and-scopes)
+            Mutable: true  
+            Name: org
+            StringAttributeConstraints:
+              MinLength: 2
+              MaxLength: 16
+          - AttributeDataType: String
+            Mutable: true
+            Name: ou
+            StringAttributeConstraints:
+              MinLength: 2
+              MaxLength: 16
+
+    mtUserPoolClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        ClientName: mt-user-pool-client
+        ExplicitAuthFlows: 
+          - ALLOW_USER_SRP_AUTH
+          - ALLOW_ADMIN_USER_PASSWORD_AUTH
+          - ALLOW_REFRESH_TOKEN_AUTH
+        RefreshTokenValidity: 30
+        SupportedIdentityProviders: [COGNITO]
+        WriteAttributes: [email, phone_number]
+        CallbackURLs:
+          - http://localhost
+        DefaultRedirectURI:  http://localhost
+        AllowedOAuthFlowsUserPoolClient: true
+        AllowedOAuthFlows: 
+          - implicit
+        AllowedOAuthScopes:
+          - openid
+          - profile
+          - email
+        UserPoolId:
+          Ref: mtUserPool
+
+    mtUserPoolDomain:
+      Type: AWS::Cognito::UserPoolDomain
+      Properties: 
+        Domain: mt-hosted
+        UserPoolId: !Ref mtUserPool
+
+    mtIdentityPool:
+      Type: AWS::Cognito::IdentityPool
+      Properties:
+        AllowUnauthenticatedIdentities: true
+        CognitoIdentityProviders:
+          - ClientId:
+              Ref: mtUserPoolClient
+            ProviderName: { Fn::GetAtt: [mtUserPool, ProviderName] }
+    
+    # NOTE!
+    # CloudFormation support for Identity Pool Principal Tag Mappings is not yet available!
+    # It is due to be released soon: https://github.com/aws-cloudformation/cloudformation-coverage-roadmap/issues/779
+    # In the meantime, the CLI or Console can be used to create it. The following CLI invocation shows an example being read back:
+    # aws cognito-identity get-principal-tag-attribute-map --identity-pool-id=eu-west-1:fe6b4542-d59c-41e9-9e72-67825e0d7be0 \ 
+    #     --identity-provider-name=cognito-idp.eu-west-1.amazonaws.com/eu-west-1_lbeDUxwB3
+    # {
+    #     "IdentityPoolId": "eu-west-1:fe6b4542-d59c-41e9-9e72-67825e0d7be0",
+    #     "IdentityProviderName": "cognito-idp.eu-west-1.amazonaws.com/eu-west-1_lbeDUxwB3",
+    #     "UseDefaults": false,
+    #     "PrincipalTags": {
+    #         "client": "aud",
+    #         "org": "org",
+    #         "ou": "ou",
+    #         "username": "sub"
+    #     }
+    # }
+
+    mtAuthenticatedIdentityPoolRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: 'Allow'
+              Principal:
+                Federated: 'cognito-identity.amazonaws.com'
+              Action:
+                - 'sts:AssumeRoleWithWebIdentity'
+                - 'sts:TagSession'
+              Condition:
+                StringEquals:
+                  'cognito-identity.amazonaws.com:aud':
+                    Ref: mtIdentityPool
+                ForAnyValue:StringLike:
+                  'cognito-identity.amazonaws.com:amr': authenticated
+        Policies:
+          - PolicyName: ${self:provider.stage}-cognito-authenticated-policy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - cognito-identity:*
+                    - cognito-sync:*
+                  Resource: '*'
+                - Effect: Allow
+                  Action:
+                    - execute-api:Invoke
+                  Resource:
+                    - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/${self:provider.stage}/*"
+
+    mtIdentityPoolRoleAttachment:
+      Type: AWS::Cognito::IdentityPoolRoleAttachment
+      Properties:
+        IdentityPoolId:
+          Ref: mtIdentityPool
+        Roles:
+          authenticated: { Fn::GetAtt: [mtAuthenticatedIdentityPoolRole, Arn] }
+
+    poolAuthorizer:
+      Type: AWS::ApiGateway::Authorizer
+      Properties:
+        IdentitySource: method.request.header.Authorization
+        Name: thing-service-authorizer
+        RestApiId:
+          Ref: ApiGatewayRestApi
+        Type: COGNITO_USER_POOLS
+        ProviderARNs:
+          - !GetAtt mtUserPool.Arn
+
+    adminGroup:
+      Type: AWS::Cognito::UserPoolGroup
+      Properties:
+        GroupName: admin
+        UserPoolId: !Ref mtUserPool
+        Description: Admin group
+
+    standardGroup:
+      Type: AWS::Cognito::UserPoolGroup
+      Properties:
+        GroupName: standard
+        UserPoolId: !Ref mtUserPool
+        Description: Standard group
+
+    AuthorizerAccessRole:
+      Type: AWS::IAM::Role
+      DependsOn: AuthorizerExecutionRole
+      Properties:
+        RoleName: authorizer-access-role-${self:provider.stage}
+        Path: '/'
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                AWS:
+                  - !GetAtt 'AuthorizerExecutionRole.Arn'
+              Action:
+                - sts:AssumeRole       
+        Policies:
+          - PolicyName: authorizer-access-role-policy-${self:provider.stage}
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - dynamodb:BatchGetItem     
+                    - dynamodb:GetItem
+                    - dynamodb:PutItem
+                    - dynamodb:DeleteItem
+                    - dynamodb:UpdateItem
+                    - dynamodb:Query
+                  Resource:  
+                    - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${self:custom.tableName}
+
+    AuthorizerExecutionRole:
+      Type: AWS::IAM::Role     
+      Properties:
+        RoleName: authorizer-execution-role-${self:provider.stage}
+        Path: '/'
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        ManagedPolicyArns: 
+          - arn:aws:iam::aws:policy/CloudWatchLambdaInsightsExecutionRolePolicy    
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+          - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess   
+        Policies:      
+          # This policy is only required if you need to look up tenant data in DDB in order to construct permissions
+          - PolicyName: authorizer-execution-policy-${self:provider.stage}
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - cognito-idp:List*                                    
+                  Resource:
+                    - !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*    
+                - Effect: Allow
+                  Action:
+                    - dynamodb:GetItem
+                    - dynamodb:Query
+                  Resource:
+                    - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${self:custom.tableName}
+
+    OpenRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: open-role-${self:provider.stage}
+        Path: '/'
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        ManagedPolicyArns: 
+          - arn:aws:iam::aws:policy/CloudWatchLambdaInsightsExecutionRolePolicy    
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+          - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess   
+        Policies:
+          - PolicyName: open-role-policy-${self:provider.stage}
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - dynamodb:BatchGetItem     
+                    - dynamodb:GetItem
+                    - dynamodb:PutItem
+                    - dynamodb:DeleteItem
+                    - dynamodb:UpdateItem
+                    - dynamodb:Query
+                  Resource:  
+                    - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${self:custom.tableName}
+
+    mtTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Delete
+      Properties:
+        TableName: ${self:custom.tableName}
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+
+  Outputs:
+    userPool:
+      Value: !Ref mtUserPool
+      Export:
+        Name: ${self:provider.stage}-mt-user-pool-id
+    userPoolClient:
+      Value: !Ref mtUserPoolClient
+      Export:
+        Name: ${self:provider.stage}-mt-user-pool-client-id
+    userPoolArn:
+      Value: !GetAtt mtUserPool.Arn
+      Export:
+        Name: ${self:provider.stage}-mt-user-pool-arn
+    userPoolProviderUrl:
+      Value: !GetAtt mtUserPool.ProviderURL
+      Export:
+        Name: ${self:provider.stage}-mt-user-pool-provider-url
+    identityPool:
+      Value: !Ref mtIdentityPool
+      Export:
+        Name: ${self:provider.stage}-mt-identity-pool
+
