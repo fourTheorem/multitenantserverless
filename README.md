@@ -18,10 +18,20 @@ npm install
 serverless deploy
 ```
 
-To start the frontend application, switch to `mtfrontend` and run the local development server:
+To start the frontend application, switch to `mtfrontend`.
+First create an environment file called `.env.development`. It will contain the Cognito and API Gateway configuration required for the AWS Amplify SDK. The values for all values can be found in the CloudFormation outputs of the deployed serverless application.
 
 ```
-cd mtfrontend
+REACT_APP_USER_POOL_ID=
+REACT_APP_USER_POOL_CLIENT_ID=
+REACT_APP_IDENTITY_POOL_ID=
+REACT_APP_AWS_REGION=
+REACT_APP_ENDPOINT_URL=
+```
+
+Then, run the local development server:
+
+```
 npm install
 npm start
 ```
