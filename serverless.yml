@@ -1,6 +1,5 @@
 service: multitenantserverless
 frameworkVersion: '2'
-
 plugins:
   - serverless-python-requirements
 
@@ -26,6 +25,8 @@ provider:
     USER_POOL_ID: !Ref mtUserPool
     USER_POOL_CLIENT_ID: !Ref mtUserPoolClient
     USER_POOL_ARN: !GetAtt mtUserPool.Arn
+  deploymentBucket:
+    blockPublicAccess: true
 
 custom:
   tableName: mt-table-${self:provider.stage}
@@ -368,6 +369,10 @@ resources:
           - AttributeName: SK
             KeyType: RANGE
         BillingMode: PAY_PER_REQUEST
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        SSESpecification:
+          SSEEnabled: true
 
   Outputs:
     userPool:
